@@ -1,0 +1,3 @@
+1. Use data from policy3 to train model1? (Step 3&4)
+2. For policy gradient, do 
+3. Reward of policy sampling (imaginary trajectory)
