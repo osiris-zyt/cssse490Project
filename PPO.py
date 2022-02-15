@@ -8,6 +8,7 @@ from torch.distributions.normal import Normal
 import torch.nn.functional as F
 from collections import deque
 import random
+import math
 
 from tqdm.std import tqdm
 import copy
@@ -79,6 +80,17 @@ class MBMPO():
 
         # Sub-Policy
         self.sub_policies = [copy.deep(self.meta_act_net) for _ in range(n_model)]
+        self.sub_policies = []
+        for i in range(3):
+            policy = nn.Sequential(
+                nn.Linear(n_state, 128),
+                nn.ReLU(),
+                nn.Linear(128, 128),
+                nn.ReLU(),
+                nn.Linear(128, 2*n_action),
+            )
+            policy.to(device)
+            self.sub_policies.add(model)
 
         # V Net
         self.v_net = nn.Sequential(
@@ -90,8 +102,8 @@ class MBMPO():
         )
         self.v_net.to(device)
         self.v_optimizer = torch.optim.Adam(self.v_net.parameters(), lr=1e-3)
-        self.act_optimizer = torch.optim.Adam(
-            self.act_net.parameters(), lr=1e-4)
+        self.meta_act_optimizer = torch.optim.Adam(
+            self.meta_act_optimizer.parameters(), lr=1e-4)
         self.old_v_net = copy.deepcopy(self.v_net)
         self.old_v_net.to(device)
         self.gamma = 0.95
@@ -143,10 +155,40 @@ class MBMPO():
         # TODO: Sample from replay buffer
         return
 
-    def updateSubPolicy(self,data=None):
+    def getUpdatedSubPolicy(self, data=None):
+        policy =  copy.deepcopy(self.meta_act_net)
+        optimizer = torch.optim.Adam(
+            policy.parameters(), lr=1e-4)
         # Policy gradient
         obs, act, reward, next_obs, done = data
-        return
+        # Calculate culmulative return
+        returns = np.zeros_like(reward)
+        s = 0
+        for i in reversed(range(len(returns))):
+            s = s * self.gamma + reward[i]
+            returns[i] = s
+
+        obs = torch.FloatTensor(obs).to(device)
+        returns = torch.FloatTensor(returns).to(device)
+        # Actions are used as indices, must be
+        # LongTensor
+        act = torch.LongTensor(act).to(device)
+        # Calculate loss
+        batch_size = 32
+        list = [j for j in range(len(obs))]
+        for i in range(0, len(list), batch_size):
+            index = list[i:i+batch_size]
+            logprob = torch.log(policy(obs[index, :]))
+            gt_logprob = returns[index] * \
+                torch.gather(logprob, 1,
+                             act[index, None]).squeeze()
+            loss = -gt_logprob.mean()
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        return policy, loss.item()
 
     def updateMetaPolicy(self, data=None):
         # PPO
@@ -224,6 +266,17 @@ class MBMPO():
         return act_loss.item(), v_loss.item(), ent_loss.item()
 
 # -------------------------------------------- ************** --------------------------------------------
+
+#Normalize function for calculating reward
+def angle_normalize(x):
+    return ((x + np.pi) % (2 * np.pi)) - np.pi
+
+#Reward Function
+def reward_calc(state, action):
+    theta_dot = state[2]
+    theta = math.atan2(state[1], state[0])
+    costs = angle_normalize(theta) ** 2 + 0.1 * theta_dot ** 2 + 0.001 * (action ** 2)
+    return -costs
 
 class ReplayBuffer:
     def __init__(self, size):
