@@ -54,17 +54,18 @@ def run_episode(env, policy, render=False):
 
 class MBMPO():
     def __init__(self, n_state, n_action, n_model = 3):
+        self.n_model = n_model
 
         # N-Model
         self.models = []
         self.model_optimzier = []
         for _ in range(n_model):
             model = nn.Sequential(
-                nn.Linear(n_state + n_action, 400),
+                nn.Linear(n_state + n_action, 250),
                 nn.ReLU(),
-                nn.Linear(400, 300),
+                nn.Linear(250, 250),
                 nn.ReLU(),
-                nn.Linear(300, n_state)
+                nn.Linear(250, n_state)
             )
             model.to(device)
             optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -80,8 +81,8 @@ class MBMPO():
             nn.Linear(128, 2*n_action),
         )
         self.meta_policy.to(device)
-        self.old_act_net = copy.deepcopy(self.meta_policy)
-        self.old_act_net.to(device)
+        self.meta_act_optimizer = torch.optim.Adam(
+        self.meta_policy.parameters(), lr=1e-4)
 
         # Sub-Policy
         self.sub_policies = []
@@ -109,10 +110,9 @@ class MBMPO():
         )
         self.v_net.to(device)
         self.v_optimizer = torch.optim.Adam(self.v_net.parameters(), lr=1e-3)
-        self.meta_act_optimizer = torch.optim.Adam(
-            self.meta_policy.parameters(), lr=1e-3)
         self.old_v_net = copy.deepcopy(self.v_net)
         self.old_v_net.to(device)
+        
         self.gamma = 0.95
         self.alpha = 0.95
         self.beta = 0.95
@@ -220,7 +220,7 @@ class MBMPO():
         # TODO: Sample from replay buffer
         model = self.models[index]
         optimizer = self.model_optimzier[index]
-        obs, act, mu, var, reward, next_obs, done = self.d.sample(32)
+        obs, act, mu, var, reward, next_obs, done = self.d.sampleHalf()
         diff = next_obs - obs
         model_input = torch.cat([obs, act], axis = 1)
         diff_h = model(model_input)
@@ -228,7 +228,7 @@ class MBMPO():
         loss.backward()
         optimizer.step()
 
-        return
+        return loss.item()
 
     def updateSubPolicy(self, index, data=None):
         ## Update using batch or one step by one step along the trajectory?
@@ -250,24 +250,24 @@ class MBMPO():
             returns[i] = s
 
         returns = torch.FloatTensor(returns)
-        # Calculate loss
-        batch_size = 32
+        # Calculate loss !! NO batch
+        # batch_size = 32
         list = [j for j in range(len(obs))]
-        for i in range(0, len(list), batch_size):
+        # for i in range(0, len(list), batch_size):
             ## ?? Use the mu and var from the subpolicy instead of from the sampling?
-            index = list[i:i+batch_size]
-            output = policy(obs[index, :])
-            mu = self.act_lim*torch.tanh(output[:,:n_action])
-            var = torch.abs(output[:,n_action:])
-            dist = Normal(mu, var)
-            logprob = dist.log_prob(act[index]).squeeze_() ## ?????
-            # logprob = torch.log(policy(obs[index, :])[0])
-            gt_logprob = returns[index] * logprob
-            loss = -gt_logprob.mean()
+        index = list
+        output = policy(obs[index, :])
+        mu = self.act_lim*torch.tanh(output[:,:n_action])
+        var = torch.abs(output[:,n_action:])
+        dist = Normal(mu, var)
+        logprob = dist.log_prob(act[index]).squeeze_() ## ?????
+        # logprob = torch.log(policy(obs[index, :])[0])
+        gt_logprob = returns[index] * logprob
+        loss = -gt_logprob.mean()
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
         return loss.item()
 
@@ -313,42 +313,42 @@ class MBMPO():
         for i in range(len(reward) - 1, -1, -1):
             gae = delta[i] + m * gae #?????? (m[i])
             adv[i] = gae
-        returns = adv + v_s
+        returns = adv.squeeze() + v_s
 
         adv = torch.FloatTensor(adv).to(device)
         returns = torch.FloatTensor(returns).to(device)
         # Calculate loss
-        batch_size = 32
+        # batch_size = 32
         list = [j for j in range(len(obs))]
-        for i in range(0, len(list), batch_size):
-            index = list[i:i+batch_size]
-            for _ in range(1):
-                output = self.meta_policy(obs[index])
-                mu = self.act_lim*torch.tanh(output[:, :n_action])
-                var = torch.abs(output[:, n_action:])
-                dist = Normal(mu, var)
-                logprob = dist.log_prob(act[index])
-                ## TODO: Old log should be replaced by log of sub-policy
-                ratio = (logprob - old_logprob[index]).exp().float().squeeze()
-                surr1 = ratio * adv[index]
-                surr2 = ratio.clamp(1.0 - self._eps_clip, 1.0 +
-                                    self._eps_clip) * adv[index]
-                act_loss = -torch.min(surr1, surr2).mean()
+        # for i in range(0, len(list), batch_size):
+        index = list
+        for _ in range(1):
+            output = self.meta_policy(obs[index])
+            mu = self.act_lim*torch.tanh(output[:, :n_action])
+            var = torch.abs(output[:, n_action:])
+            dist = Normal(mu, var)
+            logprob = dist.log_prob(act[index])
+            ## TODO: Old log should be replaced by log of sub-policy
+            ratio = (logprob - old_logprob[index]).exp().float().squeeze()
+            surr1 = ratio * adv[index]
+            surr2 = ratio.clamp(1.0 - self._eps_clip, 1.0 +
+                                self._eps_clip) * adv[index]
+            act_loss = -torch.min(surr1, surr2).mean()
 
-                ent_loss = dist.entropy().mean()
-                act_loss -= 0.01*ent_loss
-                self.meta_act_optimizer.zero_grad()
-                act_loss.backward()
-                self.meta_act_optimizer.step()
+            ent_loss = dist.entropy().mean()
+            act_loss -= 0.01*ent_loss
+            self.meta_act_optimizer.zero_grad()
+            act_loss.backward()
+            self.meta_act_optimizer.step()
 
-            for _ in range(1):
-                v_loss = F.mse_loss(self.v_net(
-                    obs[index]).squeeze(), returns[index])
-                self.v_optimizer.zero_grad()
-                v_loss.backward()
-                self.v_optimizer.step()
+        for _ in range(1):
+            v_loss = F.mse_loss(self.v_net(
+                obs[index]).squeeze(), returns[index])
+            self.v_optimizer.zero_grad()
+            v_loss.backward()
+            self.v_optimizer.step()
 
-        return act_loss.item(), v_loss.item(), ent_loss.item()
+        return act_loss.item(), v_loss.item()
 
 # -------------------------------------------- ************** --------------------------------------------
 
@@ -383,9 +383,11 @@ class ReplayBuffer:
     #     return obs, act, reward, next_obs, done
 
 
-    def sample(self, sample_size):
-        if(len(self.buff) < sample_size):
-            sample_size = len(self.buff)
+    def sampleHalf(self): ## Todo:
+        sample_size=int(len(self.buff)/4)
+        # sample_size = 100
+        # if(len(self.buff) < sample_size):
+        #     sample_size = len(self.buff)
 
         sample = random.sample(self.buff, sample_size)
         obs = torch.FloatTensor([exp[0] for exp in sample]).to(device)
@@ -410,34 +412,50 @@ class ReplayBuffer:
 # Begin Experiment
 # -------------------------------------------- ************** --------------------------------------------
 n_model = 3
-loss_act_list, loss_v_list, loss_ent_list, reward_list = [], [], [], []
+loss_act_list, loss_v_list, loss_models, reward_list = [], [], [], []
 mbmpo = MBMPO(n_state, n_action, n_model = n_model)
 loss_act, loss_v = 0, 0
 n_step = 0
-for i in tqdm(range(2000)):
+for k in tqdm(range(2000)):
     for index in range(n_model):
         mbmpo.sampleFromEnv(index) # Step 3
 
+    loss_model = 0
     for index in range(n_model):
-        mbmpo.updateModel(index) # Step 4
-        
+        loss_model += mbmpo.updateModel(index) # Step 4
+    loss_model /= 3
+    loss_models.append(loss_model)
+    
+    metadata = []
     for index in range(n_model):
         policy = mbmpo.sub_policies[index]
         policy.load_state_dict(mbmpo.meta_policy.state_dict())
         optimizer = mbmpo.sub_optimizers[index]
         model = mbmpo.models[index]
-        data = mbmpo.sampleNStep(policy, model, step = 20) # Step 6
+        data = mbmpo.sampleNStep(policy, model, step = 10 + int(k/25)) # Step 6
         mbmpo.updateSubPolicy(index, data) # Step 7
-        data = mbmpo.sampleNStep(policy, model, step = 20) # Step 8
-        mbmpo.updateMetaPolicy(data) # Step 10
+        loss_models
+        data = mbmpo.sampleNStep(policy, model, step = 10 + int(k/25)) # Step 8
+        metadata.append(data)
+        
+    new_metadata = []
+    for i in range(len(data)):
+        column = []
+        for j in range(n_model):
+            column.append(metadata[j][i])
+        new_metadata.append(np.concatenate(column,axis=0))
+        
+    mbmpo.updateMetaPolicy(new_metadata) # Step 10
     ##End for (step 9)
+    rew = sum(data[5])
+    reward_list.append(rew)
 
-    if i % 2 == 0:
-        mbmpo.old_v_net.load_state_dict(mbmpo.v_net.state_dict())
+    # if k % 1 == 0:
+    mbmpo.old_v_net.load_state_dict(mbmpo.v_net.state_dict())
 
     
-    if i > 0 and i % 50 == 0:
-        print(sum(run_episode(env, mbmpo, False)[2]))
+    if k > 0 and k % 50 == 0:
+        print(sum(run_episode(env, mbmpo, False)[2]), 'loss model', loss_model)
         # print("itr:({:>5d}) loss_act:{:>6.4f} loss_v:{:>6.4f} loss_ent:{:>6.4f} reward:{:>3.1f}".format(i, np.mean(
         #     loss_act_list[-50:]), np.mean(loss_v_list[-50:]),
         #     np.mean(loss_ent_list[-50:]), np.mean(reward_list[-50:])))
@@ -454,9 +472,6 @@ scores = [sum(run_episode(env, mbmpo, False)[2]) for _ in range(100)]
 print("Final score:", np.mean(scores))
 
 
-df = pd.DataFrame({'loss_v': loss_v_list,
-                   'loss_act': loss_act_list,
-                   'loss_ent': loss_ent_list,
-                   'reward': reward_list})
+df = pd.DataFrame({'reward': reward_list})
 df.to_csv("./ClassMaterials/Lecture_25_PPO/data/ppo.csv",
           index=False, header=True)
